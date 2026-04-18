@@ -6,6 +6,9 @@ from typing import Callable
 
 
 Validator = Callable[[str], bool]
+ConfidenceResolver = Callable[[str], str]
+CONFIDENCE_LEVELS = ("weak", "medium", "strong")
+CONFIDENCE_ORDER = {level: index for index, level in enumerate(CONFIDENCE_LEVELS)}
 
 
 @dataclass(frozen=True)
@@ -16,6 +19,9 @@ class PatternSpec:
     regex: re.Pattern[str]
     group: int = 0
     validator: Validator | None = None
+    suspicious_on_failed_validation: bool = False
+    confidence: str = "medium"
+    confidence_resolver: ConfidenceResolver | None = None
 
 
 @dataclass
@@ -24,7 +30,15 @@ class Finding:
     label: str
     kind: str
     count: int = 0
+    confidence: str = "medium"
     examples: list[str] = field(default_factory=list)
+    spans: list[tuple[int, int]] = field(default_factory=list)
+
+
+@dataclass
+class DetectionResult:
+    findings: list[Finding]
+    suspicious: list[Finding]
 
 
 def digits_only(value: str) -> str:
@@ -45,6 +59,31 @@ def is_luhn_valid(value: str) -> bool:
                 number -= 9
         total += number
     return total % 10 == 0
+
+
+def has_known_card_prefix(value: str) -> bool:
+    digits = digits_only(value)
+    if not digits:
+        return False
+    if digits[0] == "4":
+        return True
+    if digits[:2] in {"34", "37"}:
+        return True
+    if len(digits) >= 4 and 3528 <= int(digits[:4]) <= 3589:
+        return True
+    if len(digits) >= 2 and 50 <= int(digits[:2]) <= 59:
+        return True
+    if digits[0] == "6":
+        return True
+    if len(digits) >= 4 and 2200 <= int(digits[:4]) <= 2204:
+        return True
+    if len(digits) >= 4 and 2221 <= int(digits[:4]) <= 2720:
+        return True
+    return False
+
+
+def is_bank_card_valid(value: str) -> bool:
+    return is_luhn_valid(value) and has_known_card_prefix(value)
 
 
 def is_snils_valid(value: str) -> bool:
@@ -93,12 +132,14 @@ PATTERNS: list[PatternSpec] = [
         "email",
         "ordinary",
         re.compile(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", FLAGS),
+        confidence="medium",
     ),
     PatternSpec(
         "phone",
         "телефон",
         "ordinary",
         re.compile(r"(?<!\d)(?:\+7|8)[\s\-.(]*\d{3}[\s\-.)]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}(?!\d)", FLAGS),
+        confidence="medium",
     ),
     PatternSpec(
         "full_name",
@@ -111,6 +152,7 @@ PATTERNS: list[PatternSpec] = [
             r")\b",
             FLAGS,
         ),
+        confidence="medium",
     ),
     PatternSpec(
         "birth_date",
@@ -118,6 +160,7 @@ PATTERNS: list[PatternSpec] = [
         "ordinary",
         re.compile(r"(?:дата\s+рождения|родил[а-я\s]{0,18}|birth\s*date)\D{0,25}(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})", FLAGS),
         group=1,
+        confidence="medium",
     ),
     PatternSpec(
         "birth_place",
@@ -126,17 +169,22 @@ PATTERNS: list[PatternSpec] = [
         re.compile(r"(?:место\s+рождения|place\s+of\s+birth)\D{0,20}([^\n;,]{5,100})", FLAGS),
         group=1,
         validator=has_reasonable_length,
+        confidence="medium",
     ),
     PatternSpec(
         "address",
         "адрес",
         "ordinary",
         re.compile(
-            r"(?:адрес(?:\s+(?:регистрации|проживания))?|место\s+жительства|address)\D{0,20}[^\n;]{10,140}|"
-            r"\b(?:г\.|город|с\.|п\.|ул\.|улица|наб\.|пер\.|алл\.)[^\n;]{10,140}",
+            r"(?:адрес\s+(?:регистрации|проживания)|место\s+жительства|registered\s+address|residential\s+address)"
+            r"\D{0,30}[^\n;]{10,160}|"
+            r"\b(?:г\.|город)\s*[А-ЯЁA-Z][^\n;]{0,80}\b(?:ул\.|улица|пр-т|проспект|пер\.|переулок|д\.|дом)\b[^\n;]{5,120}|"
+            r"\b(?:ул\.|улица|пр-т|проспект|пер\.|переулок)\s*[А-ЯЁA-Z0-9][^\n;]{3,100}"
+            r"\b(?:д\.|дом|кв\.|квартира)\b[^\n;]{0,80}",
             FLAGS,
         ),
         validator=has_reasonable_length,
+        confidence="medium",
     ),
     PatternSpec(
         "passport_rf",
@@ -144,6 +192,7 @@ PATTERNS: list[PatternSpec] = [
         "government_id",
         re.compile(r"(?:паспорт|passport|серия\s+и\s+номер)\D{0,30}(\d{2}\s?\d{2}\s?\d{6})", FLAGS),
         group=1,
+        confidence="strong",
     ),
     PatternSpec(
         "snils",
@@ -151,6 +200,8 @@ PATTERNS: list[PatternSpec] = [
         "government_id",
         re.compile(r"\b\d{3}[-\s]\d{3}[-\s]\d{3}[-\s]?\d{2}\b", FLAGS),
         validator=is_snils_valid,
+        suspicious_on_failed_validation=True,
+        confidence="strong",
     ),
     PatternSpec(
         "inn",
@@ -159,6 +210,8 @@ PATTERNS: list[PatternSpec] = [
         re.compile(r"(?:инн|inn)\D{0,20}(\d(?:[\s-]?\d){9,11})", FLAGS),
         group=1,
         validator=is_inn_valid,
+        suspicious_on_failed_validation=True,
+        confidence="strong",
     ),
     PatternSpec(
         "driver_license",
@@ -166,19 +219,23 @@ PATTERNS: list[PatternSpec] = [
         "government_id",
         re.compile(r"(?:водительское|вод\.?\s*удостоверение|driver)\D{0,30}(\d{2}\s?\d{2}\s?\d{6})", FLAGS),
         group=1,
+        confidence="strong",
     ),
     PatternSpec(
         "mrz",
         "MRZ",
         "government_id",
         re.compile(r"\b[A-Z0-9<]{30,44}\b\s*\n?\s*\b[A-Z0-9<]{30,44}\b", re.MULTILINE),
+        confidence="strong",
     ),
     PatternSpec(
         "bank_card",
         "банковская карта",
         "payment",
         re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)", FLAGS),
-        validator=is_luhn_valid,
+        validator=is_bank_card_valid,
+        suspicious_on_failed_validation=True,
+        confidence="strong",
     ),
     PatternSpec(
         "bank_account",
@@ -186,6 +243,7 @@ PATTERNS: list[PatternSpec] = [
         "payment",
         re.compile(r"(?:р/с|расчетный\s+счет|расч[её]тный\s+сч[её]т|account)\D{0,20}(\d(?:[\s-]?\d){19})", FLAGS),
         group=1,
+        confidence="weak",
     ),
     PatternSpec(
         "bik",
@@ -193,6 +251,7 @@ PATTERNS: list[PatternSpec] = [
         "payment",
         re.compile(r"(?:бик|bik)\D{0,20}(\d{9})", FLAGS),
         group=1,
+        confidence="weak",
     ),
     PatternSpec(
         "cvv",
@@ -200,12 +259,14 @@ PATTERNS: list[PatternSpec] = [
         "payment",
         re.compile(r"(?:cvv|cvc|код\s+безопасности)\D{0,10}(\d{3,4})", FLAGS),
         group=1,
+        confidence="weak",
     ),
     PatternSpec(
         "biometric",
         "биометрические данные",
         "biometric",
         re.compile(r"\b(?:биометр\w+|отпечат(?:ок|ки)\s+пальц\w+|радужн\w+\s+оболочк\w+|голосов\w+\s+образц\w+|fingerprint|face\s?id)\b", FLAGS),
+        confidence="weak",
     ),
     PatternSpec(
         "health",
@@ -216,24 +277,28 @@ PATTERNS: list[PatternSpec] = [
             r"медицинск\w+\s+(?:карта|справка|заключени\w+|данные|сведения)|health\s+condition|medical\s+record)\b",
             FLAGS,
         ),
+        confidence="weak",
     ),
     PatternSpec(
         "religion",
         "религиозные убеждения",
         "special",
         re.compile(r"\b(?:религиоз\w+|вероисповедани\w+|religion|religious)\b", FLAGS),
+        confidence="weak",
     ),
     PatternSpec(
         "politics",
         "политические убеждения",
         "special",
         re.compile(r"\b(?:политическ\w+\s+убеждени\w+|партийн\w+|член\s+партии|political)\b", FLAGS),
+        confidence="weak",
     ),
     PatternSpec(
         "ethnicity",
         "расовая/национальная принадлежность",
         "special",
         re.compile(r"\b(?:национальност\w+|расов\w+|этническ\w+|ethnicity|race)\b", FLAGS),
+        confidence="weak",
     ),
 ]
 
@@ -260,25 +325,70 @@ def mask_value(value: str) -> str:
     return " ".join(words)[:120]
 
 
-def detect_pii(text: str, max_examples: int = 3) -> list[Finding]:
+def _add_example(finding: Finding, seen_examples: set[str], value: str, max_examples: int) -> None:
+    masked = mask_value(value)
+    if masked and masked not in seen_examples and len(finding.examples) < max_examples:
+        finding.examples.append(masked)
+        seen_examples.add(masked)
+
+
+def _add_span(finding: Finding, span: tuple[int, int], max_spans: int = 50) -> None:
+    if len(finding.spans) < max_spans:
+        finding.spans.append(span)
+
+
+def _confidence_for(spec: PatternSpec, value: str) -> str:
+    if spec.confidence_resolver:
+        confidence = spec.confidence_resolver(value)
+    else:
+        confidence = spec.confidence
+    if confidence not in CONFIDENCE_ORDER:
+        return "medium"
+    return confidence
+
+
+def detect_pii_with_suspicious(text: str, max_examples: int = 3) -> DetectionResult:
     findings: list[Finding] = []
+    suspicious: list[Finding] = []
     if not text:
-        return findings
+        return DetectionResult(findings=findings, suspicious=suspicious)
     for spec in PATTERNS:
-        finding = Finding(key=spec.key, label=spec.label, kind=spec.kind)
-        seen_examples: set[str] = set()
+        findings_by_confidence: dict[str, Finding] = {}
+        suspicious_by_confidence: dict[str, Finding] = {}
+        seen_examples_by_confidence: dict[str, set[str]] = {}
+        seen_suspicious_examples_by_confidence: dict[str, set[str]] = {}
         for match in spec.regex.finditer(text):
             try:
                 value = match.group(spec.group)
             except IndexError:
                 value = match.group(0)
+            confidence = _confidence_for(spec, value)
             if spec.validator and not spec.validator(value):
+                if spec.suspicious_on_failed_validation:
+                    suspicious_finding = suspicious_by_confidence.setdefault(
+                        confidence,
+                        Finding(key=spec.key, label=spec.label, kind=spec.kind, confidence=confidence),
+                    )
+                    suspicious_finding.count += 1
+                    _add_example(
+                        suspicious_finding,
+                        seen_suspicious_examples_by_confidence.setdefault(confidence, set()),
+                        value,
+                        max_examples,
+                    )
+                    _add_span(suspicious_finding, match.span(spec.group))
                 continue
+            finding = findings_by_confidence.setdefault(
+                confidence,
+                Finding(key=spec.key, label=spec.label, kind=spec.kind, confidence=confidence),
+            )
             finding.count += 1
-            masked = mask_value(value)
-            if masked and masked not in seen_examples and len(finding.examples) < max_examples:
-                finding.examples.append(masked)
-                seen_examples.add(masked)
-        if finding.count:
-            findings.append(finding)
-    return findings
+            _add_example(finding, seen_examples_by_confidence.setdefault(confidence, set()), value, max_examples)
+            _add_span(finding, match.span(spec.group))
+        findings.extend(finding for finding in findings_by_confidence.values() if finding.count)
+        suspicious.extend(finding for finding in suspicious_by_confidence.values() if finding.count)
+    return DetectionResult(findings=findings, suspicious=suspicious)
+
+
+def detect_pii(text: str, max_examples: int = 3) -> list[Finding]:
+    return detect_pii_with_suspicious(text, max_examples=max_examples).findings

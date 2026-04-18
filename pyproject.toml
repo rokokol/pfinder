@@ -14,12 +14,14 @@ dependencies = [
     "striprtf>=0.0.26",
     "pillow>=10.4.0",
     "pymupdf>=1.24.0",
+    "pypdfium2>=4.30.0",
     "pytesseract>=0.3.13",
     "ipykernel>=6.29.5",
 ]
 
 [project.scripts]
 pii-scan = "pii_scanner.cli:main"
+pii-example-report = "pii_scanner.example_cli:main"
 
 [dependency-groups]
 dev = [

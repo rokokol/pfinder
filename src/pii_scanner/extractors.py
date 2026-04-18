@@ -5,7 +5,7 @@ import logging
 import re
 import zipfile
 from csv import DictReader, Sniffer
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO, StringIO
 from pathlib import Path
 
@@ -15,12 +15,49 @@ class ExtractionResult:
     text: str
     file_format: str
     warnings: list[str]
+    scan_texts: list[str] = field(default_factory=list)
 
 
 TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".xml", ".log"}
 HTML_EXTENSIONS = {".html", ".htm"}
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".gif"}
 SUPPORTED_BINARY_EXTENSIONS = {".pdf", ".doc", ".docx", ".rtf", ".parquet", ".xls", ".xlsx", *IMAGE_EXTENSIONS}
+OCR_LANGUAGE_ALIASES = {
+    "ru": "rus",
+    "rus": "rus",
+    "russian": "rus",
+    "en": "eng",
+    "eng": "eng",
+    "english": "eng",
+}
+
+
+def normalize_ocr_languages(languages: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for language in languages or ():
+        value = language.strip().lower()
+        if not value:
+            continue
+        normalized_value = OCR_LANGUAGE_ALIASES.get(value, value)
+        if normalized_value not in normalized:
+            normalized.append(normalized_value)
+    return tuple(normalized)
+
+
+def _ocr_language_argument(languages: tuple[str, ...]) -> str | None:
+    if not languages:
+        return None
+    return "+".join(languages)
+
+
+def _serial_ocr_language_specs(languages: tuple[str, ...]) -> list[tuple[str | None, str]]:
+    if not languages:
+        return [(None, "default")]
+    specs: list[tuple[str | None, str]] = [(language, language) for language in languages]
+    if len(languages) > 1:
+        combined = "+".join(languages)
+        specs.append((combined, combined))
+    return specs
 
 
 def _limit_text(text: str, max_chars: int, warnings: list[str]) -> str:
@@ -90,7 +127,24 @@ class _LogCapture(logging.Handler):
         self.messages.append(record.getMessage())
 
 
-def _extract_pdf(path: Path, max_pages: int, enable_ocr: bool, warnings: list[str]) -> str:
+def _combine_scan_texts(text: str, ocr_texts: list[str], serial_ocr: bool) -> tuple[str, list[str]]:
+    parts = [part for part in [text, *ocr_texts] if part.strip()]
+    combined_text = "\n".join(parts)
+    if not serial_ocr or not ocr_texts:
+        return combined_text, []
+    scan_texts = [text] if text.strip() else []
+    scan_texts.extend(part for part in ocr_texts if part.strip())
+    return combined_text, scan_texts
+
+
+def _extract_pdf(
+    path: Path,
+    max_pages: int,
+    enable_ocr: bool,
+    serial_ocr: bool,
+    ocr_languages: tuple[str, ...],
+    warnings: list[str],
+) -> tuple[str, list[str]]:
     from pypdf import PdfReader
 
     pypdf_logger = logging.getLogger("pypdf")
@@ -109,7 +163,13 @@ def _extract_pdf(path: Path, max_pages: int, enable_ocr: bool, warnings: list[st
                 warnings.append("encrypted PDF opened with empty password")
             except Exception as exc:
                 warnings.append(f"encrypted PDF could not be decrypted: {exc}")
-                return _ocr_pdf(path, max_pages, warnings) if enable_ocr else ""
+                if enable_ocr:
+                    return _combine_scan_texts(
+                        "",
+                        _ocr_pdf(path, max_pages, warnings, serial_ocr=serial_ocr, ocr_languages=ocr_languages),
+                        serial_ocr,
+                    )
+                return "", []
         pages = reader.pages if max_pages <= 0 else reader.pages[:max_pages]
         for index, page in enumerate(pages, start=1):
             try:
@@ -129,12 +189,32 @@ def _extract_pdf(path: Path, max_pages: int, enable_ocr: bool, warnings: list[st
 
     text = "\n".join(chunks)
     needs_ocr_fallback = capture.messages or _looks_like_poor_pdf_text(text)
-    if enable_ocr and needs_ocr_fallback:
-        warnings.append("PDF OCR fallback enabled after text extraction warnings or low text quality")
-        ocr_text = _ocr_pdf(path, max_pages, warnings)
-        if ocr_text.strip():
-            return "\n".join(part for part in (text, ocr_text) if part.strip())
-    return text
+    if enable_ocr:
+        ocr_texts: list[str] = []
+        if serial_ocr:
+            specs = ", ".join(label for _, label in _serial_ocr_language_specs(ocr_languages))
+            warnings.append(f"serial OCR enabled for PDF: {specs}")
+        if needs_ocr_fallback:
+            warnings.append("PDF OCR fallback enabled after text extraction warnings or low text quality")
+            ocr_texts = _ocr_pdf(path, max_pages, warnings, serial_ocr=serial_ocr, ocr_languages=ocr_languages)
+        else:
+            image_page_indexes = _pdf_image_page_indexes(path, max_pages, warnings)
+            if image_page_indexes is None:
+                warnings.append("PDF image detection unavailable; OCRing all PDF pages to cover embedded images")
+                ocr_texts = _ocr_pdf(path, max_pages, warnings, serial_ocr=serial_ocr, ocr_languages=ocr_languages)
+            elif image_page_indexes:
+                warnings.append(f"PDF image OCR enabled for {len(image_page_indexes)} page(s) with embedded images")
+                ocr_texts = _ocr_pdf(
+                    path,
+                    max_pages,
+                    warnings,
+                    page_indexes=image_page_indexes,
+                    serial_ocr=serial_ocr,
+                    ocr_languages=ocr_languages,
+                )
+        if any(part.strip() for part in ocr_texts):
+            return _combine_scan_texts(text, ocr_texts, serial_ocr)
+    return text, []
 
 
 def _looks_like_poor_pdf_text(text: str) -> bool:
@@ -145,37 +225,245 @@ def _looks_like_poor_pdf_text(text: str) -> bool:
     return len(stripped) > 80 and letters / max(len(stripped), 1) < 0.25
 
 
-def _ocr_pdf(path: Path, max_pages: int, warnings: list[str]) -> str:
+def _pdf_image_page_indexes(path: Path, max_pages: int, warnings: list[str]) -> list[int] | None:
     try:
         import fitz
-        from PIL import Image
-        import pytesseract
     except Exception as exc:
-        warnings.append(f"PDF OCR fallback unavailable: {exc}")
-        return ""
+        fallback = _pdf_image_page_indexes_with_pypdfium2(path, max_pages, warnings)
+        if fallback is None:
+            warnings.append(f"PDF image detection unavailable: {exc}")
+        return fallback
 
     try:
         document = fitz.open(path)
     except Exception as exc:
-        warnings.append(f"PDF OCR open failed: {exc}")
+        fallback = _pdf_image_page_indexes_with_pypdfium2(path, max_pages, warnings)
+        if fallback is None:
+            warnings.append(f"PDF image detection open failed: {exc}")
+        return fallback
+
+    try:
+        page_count = len(document) if max_pages <= 0 else min(len(document), max_pages)
+        return [index for index in range(page_count) if document.load_page(index).get_images(full=True)]
+    except Exception as exc:
+        fallback = _pdf_image_page_indexes_with_pypdfium2(path, max_pages, warnings)
+        if fallback is None:
+            warnings.append(f"PDF image detection failed: {exc}")
+        return fallback
+    finally:
+        document.close()
+
+
+def _pdf_image_page_indexes_with_pypdfium2(path: Path, max_pages: int, warnings: list[str]) -> list[int] | None:
+    try:
+        import pypdfium2 as pdfium
+        from pypdfium2 import raw
+    except Exception as exc:
+        warnings.append(f"PDF image detection through pypdfium2 unavailable: {exc}")
+        return None
+
+    try:
+        document = pdfium.PdfDocument(str(path))
+    except Exception as exc:
+        warnings.append(f"PDF image detection through pypdfium2 open failed: {exc}")
+        return None
+
+    try:
+        page_count = len(document) if max_pages <= 0 else min(len(document), max_pages)
+        image_pages: list[int] = []
+        for index in range(page_count):
+            page = document[index]
+            try:
+                if any(obj.type == raw.FPDF_PAGEOBJ_IMAGE for obj in page.get_objects()):
+                    image_pages.append(index)
+            finally:
+                page.close()
+        return image_pages
+    except Exception as exc:
+        warnings.append(f"PDF image detection through pypdfium2 failed: {exc}")
+        return None
+    finally:
+        document.close()
+
+
+def _ocr_pdf(
+    path: Path,
+    max_pages: int,
+    warnings: list[str],
+    page_indexes: list[int] | None = None,
+    *,
+    serial_ocr: bool = False,
+    ocr_languages: tuple[str, ...] = (),
+) -> list[str]:
+    try:
+        return _ocr_pdf_with_pymupdf(
+            path,
+            max_pages,
+            warnings,
+            page_indexes,
+            serial_ocr=serial_ocr,
+            ocr_languages=ocr_languages,
+        )
+    except Exception as exc:
+        warnings.append(f"PDF OCR through PyMuPDF unavailable: {exc}; trying pypdfium2")
+        return _ocr_pdf_with_pypdfium2(
+            path,
+            max_pages,
+            warnings,
+            page_indexes,
+            serial_ocr=serial_ocr,
+            ocr_languages=ocr_languages,
+        )
+
+
+def _ocr_image(image, page_number: int, warnings: list[str], ocr_languages: tuple[str, ...]) -> str:
+    import pytesseract
+
+    language = _ocr_language_argument(ocr_languages)
+    try:
+        if language is None:
+            return pytesseract.image_to_string(image)
+        return pytesseract.image_to_string(image, lang=language)
+    except Exception as exc:
+        label = language or "default"
+        warnings.append(f"PDF OCR page {page_number} {label} failed: {exc}")
         return ""
 
+
+def _ocr_image_serial(image, context: str, warnings: list[str], ocr_languages: tuple[str, ...]) -> list[str]:
+    return [
+        _ocr_image_language(image, context, language, label, warnings)
+        for language, label in _serial_ocr_language_specs(ocr_languages)
+    ]
+
+
+def _ocr_image_language(image, context: str, language: str | None, label: str, warnings: list[str]) -> str:
+    import pytesseract
+
+    try:
+        if language is None:
+            return pytesseract.image_to_string(image)
+        return pytesseract.image_to_string(image, lang=language)
+    except Exception as exc:
+        warnings.append(f"{context} OCR {label} failed: {exc}")
+        return ""
+
+
+def _ocr_pdf_with_pymupdf(
+    path: Path,
+    max_pages: int,
+    warnings: list[str],
+    page_indexes: list[int] | None = None,
+    *,
+    serial_ocr: bool = False,
+    ocr_languages: tuple[str, ...] = (),
+) -> list[str]:
+    try:
+        import fitz
+        from PIL import Image
+    except Exception as exc:
+        raise RuntimeError(exc) from exc
+
+    try:
+        document = fitz.open(path)
+    except Exception as exc:
+        raise RuntimeError(f"PyMuPDF open failed: {exc}") from exc
+
     page_count = len(document) if max_pages <= 0 else min(len(document), max_pages)
-    chunks: list[str] = []
-    for index in range(page_count):
-        try:
-            page = document.load_page(index)
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-            image = Image.open(BytesIO(pixmap.tobytes("png")))
+    if page_indexes is None:
+        indexes = range(page_count)
+    else:
+        indexes = sorted({index for index in page_indexes if 0 <= index < page_count})
+    try:
+        if serial_ocr:
+            serial_results: list[str] = []
+            for language, label in _serial_ocr_language_specs(ocr_languages):
+                language_chunks: list[str] = []
+                for index in indexes:
+                    try:
+                        page = document.load_page(index)
+                        pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                        image = Image.open(BytesIO(pixmap.tobytes("png")))
+                        language_chunks.append(_ocr_image_language(image, f"PDF OCR page {index + 1}", language, label, warnings))
+                    except Exception as exc:
+                        warnings.append(f"PDF OCR page {index + 1} failed for {label}: {exc}")
+                serial_results.append("\n".join(language_chunks))
+            return serial_results
+
+        chunks: list[str] = []
+        for index in indexes:
             try:
-                chunks.append(pytesseract.image_to_string(image, lang="rus+eng"))
+                page = document.load_page(index)
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                image = Image.open(BytesIO(pixmap.tobytes("png")))
+                chunks.append(_ocr_image(image, index + 1, warnings, ocr_languages))
             except Exception as exc:
-                warnings.append(f"PDF OCR page {index + 1} rus+eng failed: {exc}; trying default OCR language")
-                chunks.append(pytesseract.image_to_string(image))
-        except Exception as exc:
-            warnings.append(f"PDF OCR page {index + 1} failed: {exc}")
-    document.close()
-    return "\n".join(chunks)
+                warnings.append(f"PDF OCR page {index + 1} failed: {exc}")
+        return ["\n".join(chunks)]
+    finally:
+        document.close()
+
+
+def _ocr_pdf_with_pypdfium2(
+    path: Path,
+    max_pages: int,
+    warnings: list[str],
+    page_indexes: list[int] | None = None,
+    *,
+    serial_ocr: bool = False,
+    ocr_languages: tuple[str, ...] = (),
+) -> list[str]:
+    try:
+        import pypdfium2 as pdfium
+    except Exception as exc:
+        warnings.append(f"PDF OCR through pypdfium2 unavailable: {exc}")
+        return []
+
+    try:
+        document = pdfium.PdfDocument(str(path))
+    except Exception as exc:
+        warnings.append(f"pypdfium2 open failed: {exc}")
+        return []
+
+    try:
+        page_count = len(document) if max_pages <= 0 else min(len(document), max_pages)
+        if page_indexes is None:
+            indexes = range(page_count)
+        else:
+            indexes = sorted({index for index in page_indexes if 0 <= index < page_count})
+        if serial_ocr:
+            serial_results: list[str] = []
+            for language, label in _serial_ocr_language_specs(ocr_languages):
+                language_chunks: list[str] = []
+                for index in indexes:
+                    page = None
+                    try:
+                        page = document[index]
+                        image = page.render(scale=2).to_pil()
+                        language_chunks.append(_ocr_image_language(image, f"PDF OCR page {index + 1}", language, label, warnings))
+                    except Exception as exc:
+                        warnings.append(f"PDF OCR page {index + 1} through pypdfium2 failed for {label}: {exc}")
+                    finally:
+                        if page is not None:
+                            page.close()
+                serial_results.append("\n".join(language_chunks))
+            return serial_results
+
+        chunks: list[str] = []
+        for index in indexes:
+            page = None
+            try:
+                page = document[index]
+                image = page.render(scale=2).to_pil()
+                chunks.append(_ocr_image(image, index + 1, warnings, ocr_languages))
+            except Exception as exc:
+                warnings.append(f"PDF OCR page {index + 1} through pypdfium2 failed: {exc}")
+            finally:
+                if page is not None:
+                    page.close()
+        return ["\n".join(chunks)]
+    finally:
+        document.close()
 
 
 def _extract_docx(path: Path, warnings: list[str]) -> str:
@@ -287,20 +575,37 @@ def _extract_excel(path: Path, max_rows: int, warnings: list[str]) -> str:
         return ""
 
 
-def _extract_image(path: Path, warnings: list[str]) -> str:
+def _extract_image(path: Path, warnings: list[str], ocr_languages: tuple[str, ...]) -> str:
     try:
         from PIL import Image
         import pytesseract
 
         image = Image.open(path)
+        language = _ocr_language_argument(ocr_languages)
         try:
-            return pytesseract.image_to_string(image, lang="rus+eng")
+            if language is None:
+                return pytesseract.image_to_string(image)
+            return pytesseract.image_to_string(image, lang=language)
         except Exception as exc:
-            warnings.append(f"OCR rus+eng failed: {exc}; trying default OCR language")
-            return pytesseract.image_to_string(image)
+            label = language or "default"
+            warnings.append(f"OCR {label} failed: {exc}")
+            return ""
     except Exception as exc:
         warnings.append(f"OCR failed: {exc}")
         return ""
+
+
+def _extract_image_serial(path: Path, warnings: list[str], ocr_languages: tuple[str, ...]) -> list[str]:
+    try:
+        from PIL import Image
+
+        image = Image.open(path)
+        specs = ", ".join(label for _, label in _serial_ocr_language_specs(ocr_languages))
+        warnings.append(f"serial OCR enabled for image: {specs}")
+        return _ocr_image_serial(image, f"OCR image {path.name}", warnings, ocr_languages)
+    except Exception as exc:
+        warnings.append(f"OCR failed: {exc}")
+        return []
 
 
 def _extract_binary_strings(path: Path, max_bytes: int, warnings: list[str]) -> str:
@@ -317,14 +622,18 @@ def extract_text(
     path: Path,
     *,
     enable_ocr: bool = False,
+    serial_ocr: bool = False,
+    ocr_languages: tuple[str, ...] | list[str] | None = None,
     max_bytes: int = 20_000_000,
     max_chars: int = 2_000_000,
     max_rows: int = 200_000,
     max_pdf_pages: int = 0,
 ) -> ExtractionResult:
     warnings: list[str] = []
+    normalized_ocr_languages = normalize_ocr_languages(ocr_languages)
     suffix = path.suffix.lower()
     text = ""
+    scan_texts: list[str] = []
     try:
         if suffix == ".csv":
             text = _extract_csv(path, max_rows, warnings)
@@ -337,16 +646,27 @@ def extract_text(
             raw = _decode_bytes(_read_limited_bytes(path, max_bytes, warnings))
             text = _strip_rtf(raw)
         elif suffix == ".pdf":
-            text = _extract_pdf(path, max_pdf_pages, enable_ocr, warnings)
+            text, scan_texts = _extract_pdf(
+                path,
+                max_pdf_pages,
+                enable_ocr,
+                serial_ocr,
+                normalized_ocr_languages,
+                warnings,
+            )
         elif suffix == ".docx":
             text = _extract_docx(path, warnings)
         elif suffix in {".parquet", ".xls", ".xlsx"}:
             text = _extract_table(path, max_rows, warnings)
         elif suffix in IMAGE_EXTENSIONS:
             if enable_ocr:
-                text = _extract_image(path, warnings)
+                if serial_ocr:
+                    scan_texts = [part for part in _extract_image_serial(path, warnings, normalized_ocr_languages) if part.strip()]
+                    text = "\n".join(scan_texts)
+                else:
+                    text = _extract_image(path, warnings, normalized_ocr_languages)
             else:
-                warnings.append("image skipped; pass --ocr to enable OCR")
+                warnings.append("image skipped; pass --ocr or --serial-ocr to enable OCR")
         elif suffix in {".doc"}:
             warnings.append("legacy binary office file processed with string fallback")
             text = _extract_binary_strings(path, max_bytes, warnings)
@@ -356,4 +676,10 @@ def extract_text(
     except Exception as exc:
         warnings.append(f"extraction failed: {exc}")
         text = ""
-    return ExtractionResult(text=_limit_text(text, max_chars, warnings), file_format=suffix or "[no_ext]", warnings=warnings)
+        scan_texts = []
+    return ExtractionResult(
+        text=_limit_text(text, max_chars, warnings),
+        file_format=suffix or "[no_ext]",
+        warnings=warnings,
+        scan_texts=[_limit_text(part, max_chars, warnings) for part in scan_texts],
+    )
