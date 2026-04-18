@@ -1,5 +1,8 @@
+from datetime import datetime
+
 from pii_scanner.patterns import detect_pii, is_inn_valid, is_luhn_valid, is_snils_valid
-from pii_scanner.scanner import classify_protection_level, display_path
+from pii_scanner.reports import submission_records
+from pii_scanner.scanner import classify_protection_level, display_path, format_submission_time
 from pii_scanner.extractors import extract_text
 
 
@@ -51,3 +54,18 @@ def test_display_path_keeps_real_filename(tmp_path) -> None:
     encoded = tmp_path / "%D0%A2%D0%B5%D1%81%D1%82.pdf"
     encoded.write_text("", encoding="utf-8")
     assert display_path(encoded, tmp_path) == "%D0%A2%D0%B5%D1%81%D1%82.pdf"
+
+
+def test_submission_time_format_is_lowercase_ls_style() -> None:
+    timestamp = datetime(2024, 9, 26, 18, 31).timestamp()
+    assert format_submission_time(timestamp) == "sep 26 18:31"
+
+
+def test_submission_records_have_required_fields_only() -> None:
+    summary = {
+        "results": [
+            {"size": 10, "time": "sep 26 18:31", "path": "CA01_01.tif", "counts": {"ФИО": 1}},
+            {"size": 20, "time": "sep 26 18:32", "path": "clean.txt", "counts": {}},
+        ]
+    }
+    assert submission_records(summary) == [{"size": 10, "time": "sep 26 18:31", "name": "CA01_01.tif"}]

@@ -12,7 +12,19 @@ def _ensure_parent(path: Path) -> None:
 
 def write_json_report(summary: dict, path: Path) -> None:
     _ensure_parent(path)
-    path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(submission_records(summary), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def submission_records(summary: dict) -> list[dict]:
+    return [
+        {
+            "size": result["size"],
+            "time": result["time"],
+            "name": result["path"],
+        }
+        for result in summary["results"]
+        if result["counts"]
+    ]
 
 
 def write_csv_report(summary: dict, path: Path) -> None:
@@ -20,31 +32,10 @@ def write_csv_report(summary: dict, path: Path) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=[
-                "путь",
-                "категории_ПДн",
-                "количество_находок",
-                "УЗ",
-                "формат_файла",
-                "примеры_маскированные",
-                "ошибки",
-                "предупреждения",
-            ],
+            fieldnames=["size", "time", "name"],
         )
         writer.writeheader()
-        for result in summary["results"]:
-            writer.writerow(
-                {
-                    "путь": result["path"],
-                    "категории_ПДн": "; ".join(result["categories"]),
-                    "количество_находок": json.dumps(result["counts"], ensure_ascii=False),
-                    "УЗ": result["protection_level"],
-                    "формат_файла": result["file_format"],
-                    "примеры_маскированные": json.dumps(result["examples"], ensure_ascii=False),
-                    "ошибки": result["error"] or "",
-                    "предупреждения": "; ".join(result["warnings"]),
-                }
-            )
+        writer.writerows(submission_records(summary))
 
 
 def write_markdown_report(summary: dict, path: Path) -> None:
@@ -89,4 +80,3 @@ def write_reports(summary: dict, json_path: Path, csv_path: Path | None, markdow
         write_csv_report(summary, csv_path)
     if markdown_path:
         write_markdown_report(summary, markdown_path)
-

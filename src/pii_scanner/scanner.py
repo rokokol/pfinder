@@ -12,6 +12,7 @@ from .patterns import Finding, detect_pii
 
 
 SKIP_DIRS = {".git", ".venv", "__pycache__", ".ipynb_checkpoints"}
+MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
 
 
 @dataclass
@@ -29,6 +30,8 @@ class ScannerConfig:
 
 @dataclass
 class FileResult:
+    size: int
+    time: str
     path: str
     file_format: str
     categories: list[str]
@@ -57,6 +60,11 @@ def display_path(path: Path, root: Path) -> str:
         return str(path)
 
 
+def format_submission_time(timestamp: float) -> str:
+    dt = datetime.fromtimestamp(timestamp)
+    return f"{MONTHS[dt.month - 1]} {dt.day:02d} {dt.hour:02d}:{dt.minute:02d}"
+
+
 def classify_protection_level(findings: list[Finding], high_volume_threshold: int = 100) -> str:
     if not findings:
         return "нет ПДн"
@@ -75,6 +83,7 @@ def classify_protection_level(findings: list[Finding], high_volume_threshold: in
 
 
 def scan_file(path: Path, root: Path, config: ScannerConfig) -> FileResult:
+    stat = path.stat()
     try:
         extracted = extract_text(
             path,
@@ -89,6 +98,8 @@ def scan_file(path: Path, root: Path, config: ScannerConfig) -> FileResult:
         counts = {finding.label: finding.count for finding in findings}
         examples = {finding.label: finding.examples for finding in findings if finding.examples}
         return FileResult(
+            size=stat.st_size,
+            time=format_submission_time(stat.st_mtime),
             path=display_path(path, root),
             file_format=extracted.file_format,
             categories=categories,
@@ -99,6 +110,8 @@ def scan_file(path: Path, root: Path, config: ScannerConfig) -> FileResult:
         )
     except Exception as exc:
         return FileResult(
+            size=stat.st_size,
+            time=format_submission_time(stat.st_mtime),
             path=str(path),
             file_format=path.suffix.lower() or "[no_ext]",
             categories=[],

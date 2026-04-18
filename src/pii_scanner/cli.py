@@ -13,9 +13,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Scan files for personal data and produce JSON/CSV/Markdown reports.",
     )
     parser.add_argument("input_path", type=Path, help="File or directory to analyze.")
-    parser.add_argument("--output", type=Path, default=Path("reports/pii_report.json"), help="JSON report path.")
-    parser.add_argument("--csv-output", type=Path, default=Path("reports/pii_report.csv"), help="CSV report path.")
-    parser.add_argument("--markdown-output", type=Path, default=Path("reports/pii_report.md"), help="Markdown report path.")
+    parser.add_argument("--output", type=Path, default=Path("reports/result.json"), help="Submission JSON report path.")
+    parser.add_argument("--csv-output", type=Path, default=Path("reports/result.csv"), help="Submission CSV report path.")
+    parser.add_argument("--markdown-output", type=Path, default=Path("reports/result.md"), help="Markdown summary report path.")
     parser.add_argument("--no-csv", action="store_true", help="Do not write the CSV report.")
     parser.add_argument("--no-markdown", action="store_true", help="Do not write the Markdown report.")
     parser.add_argument("--only-findings", action="store_true", help="Exclude files with no detected PII from reports.")
@@ -63,4 +63,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
