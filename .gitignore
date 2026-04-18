@@ -1,0 +1,16 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Generated reports can contain sensitive paths and masked evidence.
+reports/*.json
+reports/*.csv
+reports/*.md
+
+# Notebook runtime checkpoints.
+.ipynb_checkpoints/
+
+# dataset
+ПДнDataset/
+

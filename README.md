@@ -1,25 +1,27 @@
-# PII Scanner Hackathon Utility
+# Утилита поиска ПДн для хакатона
 
-Terminal utility for the hackathon task in `ПДнDataset/HACKATHON_CASE.md`: scan a directory or file, detect personal-data categories, classify the required protection level, and write structured reports.
+Терминальная утилита для задания из `ПДнDataset/HACKATHON_CASE.md`: рекурсивно сканирует файл или директорию, извлекает текст из разных форматов, ищет категории персональных данных, определяет уровень защищенности и формирует отчеты.
 
-## Setup
+## Установка Python-зависимостей
 
 ```bash
 uv sync
 ```
 
-## Tesseract OCR Setup
+`uv` создает виртуальное окружение и устанавливает Python-библиотеки, включая парсеры PDF/DOCX/RTF/XLS/XLSX, OCR-обертку `pytesseract` и `PyMuPDF` для рендера PDF-страниц.
 
-`uv` installs the Python wrapper `pytesseract`, but it does not install the system `tesseract` binary. OCR mode requires both the binary and the Russian/English language data.
+## Установка Tesseract OCR
 
-Check the current server:
+`uv` устанавливает только Python-обертку `pytesseract`, но не системную программу `tesseract`. Для режима OCR нужен установленный бинарник Tesseract и языковые данные для русского и английского.
+
+Проверка сервера:
 
 ```bash
 tesseract --version
 tesseract --list-langs
 ```
 
-The language list should include `rus` and `eng`.
+В списке языков должны быть `rus` и `eng`.
 
 Ubuntu/Debian:
 
@@ -34,9 +36,11 @@ Nix shell:
 nix shell nixpkgs#tesseract
 ```
 
-After entering the shell, re-run `tesseract --list-langs`. If `rus` is missing, install or expose the Russian tessdata package available for the server's Nix channel.
+После входа в shell повторно проверьте `tesseract --list-langs`. Если `rus` отсутствует, нужно установить или подключить пакет с русскими tessdata, доступный в Nix-канале сервера.
 
-## Run
+## Запуск
+
+Базовый запуск без OCR:
 
 ```bash
 uv run pii-scan "ПДнDataset/share" \
@@ -45,32 +49,57 @@ uv run pii-scan "ПДнDataset/share" \
   --markdown-output reports/pii_report.md
 ```
 
-Single full report with OCR enabled:
+Полный итоговый запуск с OCR:
 
 ```bash
 uv run pii-scan "ПДнDataset/share" \
-  --output reports/pii_report.json \
-  --csv-output reports/pii_report.csv \
-  --markdown-output reports/pii_report.md \
+  --output reports/result.json \
+  --csv-output reports/result.csv \
+  --markdown-output reports/result.md \
   --workers 4 \
   --only-findings \
   --ocr \
   --verbose
 ```
 
-Useful options:
+## Результат
 
-- `--ocr` enables OCR for images through `pytesseract` and a system Tesseract installation.
-- `--only-findings` keeps only files with detected PII in reports.
-- `--workers 4` scans files concurrently.
-- `--limit 100` scans only the first 100 files for smoke tests.
+Команда выше делает один общий проход по всему `ПДнDataset/share`. Разбиения отчета по папкам, форматам или отдельным файлам нет.
 
-The scanner masks examples in reports and stores categories, counts, paths, file formats, and protection levels instead of raw personal-data values.
+Итоговые файлы:
 
-Notes:
+- `reports/result.csv` - основной табличный отчет для сдачи по ТЗ;
+- `reports/result.md` - краткая человекочитаемая сводка;
+- `reports/result.json` - полный технический отчет со всей структурой результата.
 
-- OCR requires a system Tesseract installation in addition to Python packages.
-- When `--ocr` is enabled, PDFs with text-extraction warnings such as `SymbolSetEncoding` are rendered through PyMuPDF and passed to Tesseract as a fallback.
-- Filenames are shown exactly as they exist on disk, including URL-encoded names such as `%D0%A2%D0%B5%D1%81%D1%82.pdf`.
-- Unsupported binary files without a known extension, including ELF files recovered into `lost+found`, are skipped instead of scanning random printable strings.
-- Parquet extraction uses `pyarrow`. If the runtime misses `libstdc++.so.6`, Parquet files are skipped with warnings instead of crashing the scan.
+`result.csv` содержит строки по найденным файлам и колонки `путь`, `категории_ПДн`, `количество_находок`, `УЗ`, `формат_файла`, `примеры_маскированные`, `ошибки`, `предупреждения`.
+
+`result.md` содержит общую статистику, распределение по уровням защищенности, распределение по категориям ПДн и список файлов с наибольшим числом находок.
+
+Если для сдачи нужны только CSV и Markdown, `reports/result.json` можно удалить после завершения запуска. Утилита все равно создает JSON как основной машинно-читаемый формат.
+
+## Основные параметры
+
+- `--ocr` включает OCR для изображений и fallback OCR для проблемных PDF.
+- `--only-findings` оставляет в отчетах только файлы, где найдены ПДн.
+- `--workers 4` обрабатывает несколько файлов параллельно.
+- `--limit 100` сканирует только первые 100 файлов для быстрой проверки.
+- `--max-pdf-pages N` ограничивает число страниц PDF.
+- `--high-volume-threshold 100` задает порог большого объема находок для классификации УЗ.
+
+## Форматы и поведение
+
+Утилита поддерживает best-effort извлечение текста из `CSV`, `JSON`, `Parquet`, `PDF`, `DOCX`, `RTF`, `XLS/XLSX`, `HTML`, текстовых файлов и изображений. Для изображений нужен `--ocr`.
+
+Если `--ocr` включен, PDF с предупреждениями текстового извлечения, например `SymbolSetEncoding`, дополнительно рендерятся через `PyMuPDF` и читаются Tesseract.
+
+Имена файлов в отчетах выводятся ровно так, как они лежат на диске. URL-encoded имена вроде `%D0%A2%D0%B5%D1%81%D1%82.pdf` не декодируются.
+
+Неподдерживаемые бинарные файлы без известного расширения, включая ELF-файлы из `lost+found`, пропускаются. Случайные строки из бинарников не используются для поиска ПДн.
+
+Parquet читается через `pyarrow`. Если в окружении не хватает системных библиотек, например `libstdc++.so.6`, такие файлы пропускаются с предупреждением, но весь скан не падает.
+
+## Безопасность отчета
+
+В отчеты не записываются полные найденные значения ПДн. Программа сохраняет путь, категории, количество находок, уровень защищенности, формат файла, предупреждения и несколько маскированных примеров.
+
